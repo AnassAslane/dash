@@ -1,358 +1,340 @@
-import React, { useEffect, useState, createContext, useContext } from 'react';
-import { Line } from 'react-chartjs-2';
-import { Chart, CategoryScale, LinearScale, PointElement, LineElement } from 'chart.js';
-import { io } from 'socket.io-client';
-import { ToastContainer, toast } from 'react-toastify';
-import { motion, AnimatePresence } from 'framer-motion';
-import 'react-toastify/dist/ReactToastify.css';
-import { FiUser, FiLock, FiArrowRight, FiSun, FiDroplet, FiPlus, FiMoon, FiSettings } from 'react-icons/fi';
-import './App.css';
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const { Server } = require('socket.io');
+const http = require('http');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
+const { body, validationResult } = require('express-validator');
 
-Chart.register(CategoryScale, LinearScale, PointElement, LineElement);
+const app = express();
+const server = http.createServer(app);
+const JWT_SECRET = 'your_secure_jwt_secret';
 
-const ThemeContext = createContext();
-export const useTheme = () => useContext(ThemeContext);
+const io = new Server(server, {
+  cors: {
+    origin: "http://localhost:3000",
+    methods: ["GET", "POST"],
+    credentials: true
+  }
+});
 
-const AuthForm = ({ onLogin }) => {
-  const [credentials, setCredentials] = useState({ username: '', password: '' });
-  const { theme } = useTheme();
+app.use(express.json());
+app.use(cors({
+  origin: "http://localhost:3000",
+  credentials: true
+}));
 
-  return (
-    <motion.div 
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.5 }}
-      className="auth-container"
-    >
-      <motion.div 
-        className="auth-card"
-        initial={{ scale: 0.95 }}
-        animate={{ scale: 1 }}
-        whileHover={{ scale: 1.02 }}
-      >
-        <div className="auth-header">
-          <motion.h1 initial={{ y: -20 }} animate={{ y: 0 }}>IoT Dashboard</motion.h1>
-          <p>Monitor your connected devices</p>
-        </div>
-        
-        <form onSubmit={(e) => {
-          e.preventDefault();
-          onLogin(credentials);
-        }}>
-          <div className="auth-input-group">
-            <FiUser className="auth-icon" />
-            <input
-              name="username"
-              value={credentials.username}
-              onChange={(e) => setCredentials({...credentials, username: e.target.value})}
-              placeholder="Username"
-              required
-            />
-          </div>
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: 'Too many login attempts, please try again later'
+});
 
-          <div className="auth-input-group">
-            <FiLock className="auth-icon" />
-            <input
-              name="password"
-              type="password"
-              value={credentials.password}
-              onChange={(e) => setCredentials({...credentials, password: e.target.value})}
-              placeholder="Password"
-              required
-            />
-          </div>
+// Database schemas
+const notificationSchema = new mongoose.Schema({
+  message: String,
+  timestamp: { type: Date, default: Date.now },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+});
 
-          <motion.button 
-            type="submit" 
-            className="auth-submit"
-            whileHover={{ scale: 1.05 }}
-            whileTap={{ scale: 0.95 }}
-          >
-            Sign In <FiArrowRight className="auth-arrow" />
-          </motion.button>
-        </form>
-      </motion.div>
-    </motion.div>
-  );
+const userSchema = new mongoose.Schema({
+  username: { type: String, unique: true },
+  password: String,
+  role: { type: String, enum: ['user', 'admin'], default: 'user' },
+  alertPreferences: {
+    maxTemp: { type: Number, default: 30 },
+    maxHumidity: { type: Number, default: 70 }
+  }
+});
+
+const sensorSchema = new mongoose.Schema({
+  temperature: Number,
+  humidity: Number,
+  timestamp: { type: Date, default: Date.now },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+});
+
+const deviceSchema = new mongoose.Schema({
+  name: String,
+  type: String,
+  location: String,
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  lastActive: Date
+});
+
+deviceSchema.virtual('status').get(function() {
+  const inactiveTime = Date.now() - this.lastActive.getTime();
+  return inactiveTime < 300000 ? 'online' : 'offline';
+});
+
+const User = mongoose.model('User', userSchema);
+const SensorData = mongoose.model('SensorData', sensorSchema, 'sensor_data');
+const Device = mongoose.model('Device', deviceSchema);
+const Notification = mongoose.model('Notification', notificationSchema);
+
+const authenticate = async (req, res, next) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) throw new Error('No token provided');
+    
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = await User.findById(decoded.userId);
+    if (!req.user) throw new Error('User not found');
+    
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Authentication failed' });
+  }
 };
 
-const DeviceManager = () => {
-  const [newDevice, setNewDevice] = useState({ name: '', type: 'temperature', location: '' });
+const validateDevice = [
+  body('name').trim().escape().notEmpty(),
+  body('location').trim().escape().notEmpty(),
+  (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+    next();
+  }
+];
 
-  const handleAddDevice = async () => {
-    try {
-      const response = await fetch('http://localhost:5000/api/devices', {
-        method: 'POST',
-        headers: { 
-          'Authorization': `Bearer ${localStorage.getItem('token')}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(newDevice)
-      });
+app.post('/api/auth/register', authLimiter, async (req, res) => {
+  try {
+    const hashedPassword = await bcrypt.hash(req.body.password, 10);
+    const user = new User({
+      username: req.body.username,
+      password: hashedPassword
+    });
+    await user.save();
+    res.status(201).json({ message: 'User created' });
+  } catch (error) {
+    res.status(400).json({ error: 'Registration failed: ' + error.message });
+  }
+});
+
+app.post('/api/auth/login', authLimiter, async (req, res) => {
+  try {
+    const user = await User.findOne({ username: req.body.username });
+    if (!user) return res.status(400).json({ error: 'Invalid credentials' });
+
+    const validPassword = await bcrypt.compare(req.body.password, user.password);
+    if (!validPassword) return res.status(400).json({ error: 'Invalid credentials' });
+
+    const token = jwt.sign({ userId: user._id }, JWT_SECRET);
+    res.json({
+      token,
+      user: {
+        id: user._id,
+        username: user.username,
+        role: user.role
+      },
+      alertPreferences: user.alertPreferences
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Login failed: ' + error.message });
+  }
+});
+
+app.put('/api/alerts', authenticate, async (req, res) => {
+  try {
+    const updatedUser = await User.findByIdAndUpdate(
+      req.user._id,
+      { $set: { alertPreferences: req.body } },
+      { new: true }
+    );
+    res.json(updatedUser.alertPreferences);
+  } catch (error) {
+    res.status(400).json({ error: 'Update failed: ' + error.message });
+  }
+});
+
+app.get('/api/data/historical', authenticate, async (req, res) => {
+  try {
+    const getStartDate = (range) => {
+      const now = new Date();
+      const startDate = new Date(now);
       
-      const data = await response.json();
-      
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to add device');
+      switch(range) {
+        case '1h': startDate.setHours(now.getHours() - 1); break;
+        case '24h': startDate.setDate(now.getDate() - 1); break;
+        case '7d': startDate.setDate(now.getDate() - 7); break;
+        default: startDate.setDate(now.getDate() - 1);
       }
+      return startDate;
+    };
+
+    const data = await SensorData.find({
+      userId: req.user._id,
+      timestamp: { $gte: getStartDate(req.query.range) }
+    }).sort({ timestamp: -1 });
+
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch historical data' });
+  }
+});
+
+app.get('/api/devices', authenticate, async (req, res) => {
+  try {
+    const query = req.user.role === 'admin' ? {} : { userId: req.user._id };
+    const devices = await Device.find(query);
+    res.json(devices);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch devices' });
+  }
+});
+
+app.get('/api/notifications', authenticate, async (req, res) => {
+  try {
+    const notifications = await Notification.find({ userId: req.user._id })
+      .sort({ timestamp: -1 })
+      .limit(50);
+    res.json(notifications);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch notifications' });
+  }
+});
+
+app.get('/api/data/export', authenticate, async (req, res) => {
+  try {
+    const getStartDate = (range) => {
+      const now = new Date();
+      const startDate = new Date(now);
       
-      setNewDevice({ name: '', type: 'temperature', location: '' });
-      toast.success('Device added successfully');
-    } catch (error) {
-      console.error('Device creation error:', error);
-      toast.error(error.message);
-    }
-  };
-
-  return (
-    <motion.div 
-      className="device-manager"
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-    >
-      <h3><FiSettings /> Device Management</h3>
-      <div className="device-form">
-        <input
-          placeholder="Device Name"
-          value={newDevice.name}
-          onChange={(e) => setNewDevice({...newDevice, name: e.target.value})}
-          required
-        />
-        <select
-          value={newDevice.type}
-          onChange={(e) => setNewDevice({...newDevice, type: e.target.value})}
-        >
-          <option value="temperature">Temperature Sensor</option>
-          <option value="humidity">Humidity Sensor</option>
-          <option value="motion">Motion Sensor</option>
-        </select>
-        <input
-          placeholder="Location"
-          value={newDevice.location}
-          onChange={(e) => setNewDevice({...newDevice, location: e.target.value})}
-          required
-        />
-        <motion.button 
-          onClick={handleAddDevice}
-          whileHover={{ scale: 1.05 }}
-          whileTap={{ scale: 0.95 }}
-        >
-          <FiPlus /> Add Device
-        </motion.button>
-      </div>
-    </motion.div>
-  );
-};
-
-const AlertSettings = ({ alerts, onUpdate }) => {
-  return (
-    <motion.div 
-      className="alert-settings"
-      initial={{ scale: 0.95 }}
-      animate={{ scale: 1 }}
-    >
-      <h3>Alert Thresholds</h3>
-      <div className="alert-inputs">
-        <div className="input-group">
-          <FiSun />
-          <input
-            type="number"
-            value={alerts.maxTemp}
-            onChange={(e) => onUpdate({ ...alerts, maxTemp: Number(e.target.value) })}
-            placeholder="Max Temperature (°C)"
-            min="0"
-          />
-        </div>
-        <div className="input-group">
-          <FiDroplet />
-          <input
-            type="number"
-            value={alerts.maxHumidity}
-            onChange={(e) => onUpdate({ ...alerts, maxHumidity: Number(e.target.value) })}
-            placeholder="Max Humidity (%)"
-            min="0"
-            max="100"
-          />
-        </div>
-      </div>
-    </motion.div>
-  );
-};
-
-export default function App() {
-  const [sensorData, setSensorData] = useState([]);
-  const [user, setUser] = useState(null);
-  const [alerts, setAlerts] = useState({ maxTemp: 30, maxHumidity: 70 });
-  const [timeRange, setTimeRange] = useState('24h');
-  const [theme, setTheme] = useState('light');
-
-  const fetchHistoricalData = async (range) => {
-    try {
-      const response = await fetch(`http://localhost:5000/api/data/historical?range=${range}`, {
-        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
-      });
-      
-      if (!response.ok) throw new Error('Failed to load data');
-      
-      const data = await response.json();
-      setSensorData(data);
-    } catch (error) {
-      toast.error(error.message);
-    }
-  };
-
-  const handleLogin = async (credentials) => {
-    try {
-      const response = await fetch('http://localhost:5000/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(credentials)
-      });
-      
-      const data = await response.json();
-      if (response.ok) {
-        localStorage.setItem('token', data.token);
-        localStorage.setItem('userId', data.user.id);
-        setUser(data.user);
-        setAlerts(data.alertPreferences || alerts);
-        toast.success(`Welcome ${data.user.username}!`);
-      } else {
-        toast.error(data.error || 'Login failed');
+      switch(range) {
+        case '1h': startDate.setHours(now.getHours() - 1); break;
+        case '24h': startDate.setDate(now.getDate() - 1); break;
+        case '7d': startDate.setDate(now.getDate() - 7); break;
+        default: startDate.setDate(now.getDate() - 1);
       }
-    } catch (error) {
-      toast.error('Network error. Please try again.');
+      return startDate;
+    };
+
+    const data = await SensorData.find({
+      userId: req.user._id,
+      timestamp: { $gte: getStartDate(req.query.range) }
+    }).sort({ timestamp: -1 });
+
+    let csv = 'Timestamp,Temperature,Humidity\n';
+    data.forEach(d => {
+      csv += `${d.timestamp.toISOString()},${d.temperature},${d.humidity}\n`;
+    });
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=sensor-data.csv');
+    res.send(csv);
+  } catch (error) {
+    res.status(500).json({ error: 'Export failed' });
+  }
+});
+
+app.post('/api/devices', authenticate, validateDevice, async (req, res) => {
+  try {
+    const device = new Device({
+      ...req.body,
+      userId: req.user._id,
+      lastActive: new Date()
+    });
+    await device.save();
+    res.status(201).json(device);
+  } catch (error) {
+    res.status(400).json({ error: 'Device registration failed' });
+  }
+});
+app.post('/api/data', authenticate, async (req, res) => {
+  try {
+    const newData = new SensorData({
+      temperature: req.body.temperature,
+      humidity: req.body.humidity,
+      userId: req.user._id
+    });
+    
+    await newData.save();
+    res.status(201).json(newData);
+  } catch (error) {
+    res.status(400).json({ error: 'Failed to save sensor data' });
+  }
+});
+io.on('connection', (socket) => {
+  socket.on('authenticate', async (token) => {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      const user = await User.findById(decoded.userId);
+
+      const sensorChangeStream = SensorData.watch([{ 
+        $match: { 
+          'fullDocument.userId': user._id,
+          'operationType': 'insert'
+        } 
+      }]);
+
+      const deviceChangeStream = Device.watch([{
+        $match: {
+          'fullDocument.userId': user._id,
+          'operationType': { $in: ['insert', 'update'] }
+        }
+      }]);
+
+      sensorChangeStream.on('change', async (change) => {
+        const data = change.fullDocument;
+        if (data.temperature > user.alertPreferences.maxTemp ||
+            data.humidity > user.alertPreferences.maxHumidity) {
+          const notification = new Notification({
+            message: `Alert! Temp: ${data.temperature}°C, Humidity: ${data.humidity}%`,
+            userId: user._id
+          });
+          await notification.save();
+          
+          socket.emit('alert', {
+            message: notification.message,
+            timestamp: notification.timestamp
+          });
+        }
+        socket.emit('newData', data);
+      });
+
+      deviceChangeStream.on('change', async (change) => {
+        if (change.operationType === 'update') {
+          await Device.findByIdAndUpdate(
+            change.documentKey._id,
+            { lastActive: new Date() }
+          );
+        }
+        socket.emit('deviceUpdate', change.fullDocument);
+      });
+
+      socket.on('disconnect', () => {
+        sensorChangeStream.close();
+        deviceChangeStream.close();
+      });
+
+    } catch (err) {
+      socket.disconnect();
     }
-  };
+  });
+});
 
-  useEffect(() => {
-    if (user) fetchHistoricalData(timeRange);
-  }, [timeRange, user]);
-
-  useEffect(() => {
-    const token = localStorage.getItem('token');
-    if (!token || !user) return;
-
-    const socket = io('http://localhost:5000', {
-      auth: { token },
-      transports: ['websocket']
+const connectDB = async () => {
+  try {
+    await mongoose.connect('mongodb://localhost:27017/iot_data', {
+      useNewUrlParser: true,
+      useUnifiedTopology: true
     });
-
-    socket.on('alert', (alert) => {
-      toast.error(alert.message, { position: 'top-center' });
+    console.log('MongoDB Connected');
+    
+    await Device.createIndexes({ userId: 1 });
+    await Notification.createIndexes({ userId: 1, timestamp: -1 });
+    
+    server.listen(5000, () => {
+      console.log('Server running on http://localhost:5000');
     });
+  } catch (err) {
+    console.error('Database connection failed:', err);
+    process.exit(1);
+  }
+};
 
-    socket.on('newData', (newData) => {
-      setSensorData(prev => [newData, ...prev.slice(0, 49)]);
-    });
-
-    return () => socket.disconnect();
-  }, [user]);
-
-  return (
-    <ThemeContext.Provider value={{ theme, toggleTheme: () => setTheme(prev => prev === 'light' ? 'dark' : 'light') }}>
-      <div className={`app-container`} data-theme={theme}>
-        <AnimatePresence mode='wait'>
-          {!user ? (
-            <AuthForm key="auth" onLogin={handleLogin} />
-          ) : (
-            <motion.div
-              key="dashboard"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="dashboard-container"
-            >
-              <div className="dashboard-header">
-                <h2>Welcome back, {user.username}!</h2>
-                <div className="controls">
-                  <motion.button 
-                    onClick={() => setTheme(prev => prev === 'light' ? 'dark' : 'light')}
-                    whileHover={{ scale: 1.1 }}
-                    data-theme-toggle
-                  >
-                    {theme === 'light' ? <FiMoon /> : <FiSun />}
-                  </motion.button>
-                  <select 
-                    value={timeRange} 
-                    onChange={(e) => setTimeRange(e.target.value)}
-                  >
-                    <option value="1h">Last 1 Hour</option>
-                    <option value="24h">Last 24 Hours</option>
-                    <option value="7d">Last 7 Days</option>
-                  </select>
-                </div>
-              </div>
-              
-              <div className="dashboard-content">
-                <div className="sidebar">
-                  <DeviceManager />
-                  <AlertSettings alerts={alerts} onUpdate={setAlerts} />
-                </div>
-                
-                <div className="main-content">
-                  <div className="chart-container">
-                    <Line
-                      data={{
-                        labels: sensorData.map(d => new Date(d.timestamp).toLocaleTimeString()),
-                        datasets: [
-                          {
-                            label: 'Temperature (°C)',
-                            data: sensorData.map(d => d.temperature),
-                            borderColor: '#ff6384',
-                            backgroundColor: 'rgba(255, 99, 132, 0.2)',
-                            tension: 0.4
-                          },
-                          {
-                            label: 'Humidity (%)',
-                            data: sensorData.map(d => d.humidity),
-                            borderColor: '#36a2eb',
-                            backgroundColor: 'rgba(54, 162, 235, 0.2)',
-                            tension: 0.4
-                          }
-                        ]
-                      }}
-                      options={{ 
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        animation: {
-                          duration: 1000,
-                          easing: 'easeOutCubic'
-                        },
-                        plugins: {
-                          legend: {
-                            labels: {
-                              color: 'var(--chart-text)'
-                            }
-                          }
-                        },
-                        scales: {
-                          x: {
-                            grid: { 
-                              color: 'var(--chart-grid)'
-                            },
-                            ticks: { 
-                              color: 'var(--chart-text)'
-                            }
-                          },
-                          y: {
-                            grid: { 
-                              color: 'var(--chart-grid)'
-                            },
-                            ticks: { 
-                              color: 'var(--chart-text)'
-                            }
-                          }
-                        }
-                      }}
-                    />
-                  </div>
-                </div>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-        <ToastContainer theme={theme} />
-      </div>
-    </ThemeContext.Provider>
-  );
-}
+connectDB();
