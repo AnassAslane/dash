@@ -15,7 +15,7 @@ const JWT_SECRET = 'your_secure_jwt_secret';
 const io = new Server(server, {
   cors: {
     origin: "http://localhost:3000",
-    methods: ["GET", "POST"],
+    methods: ["GET", "POST", "DELETE"],
     credentials: true
   }
 });
@@ -36,7 +36,8 @@ const authLimiter = rateLimit({
 const notificationSchema = new mongoose.Schema({
   message: String,
   timestamp: { type: Date, default: Date.now },
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  read: { type: Boolean, default: false }
 });
 
 const userSchema = new mongoose.Schema({
@@ -101,6 +102,7 @@ const validateDevice = [
   }
 ];
 
+// Auth Routes
 app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const hashedPassword = await bcrypt.hash(req.body.password, 10);
@@ -138,6 +140,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   }
 });
 
+// Alert Settings
 app.put('/api/alerts', authenticate, async (req, res) => {
   try {
     const updatedUser = await User.findByIdAndUpdate(
@@ -151,6 +154,81 @@ app.put('/api/alerts', authenticate, async (req, res) => {
   }
 });
 
+// Device Routes
+app.get('/api/devices', authenticate, async (req, res) => {
+  try {
+    const query = req.user.role === 'admin' ? {} : { userId: req.user._id };
+    const devices = await Device.find(query);
+    res.json(devices);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch devices' });
+  }
+});
+
+app.post('/api/devices', authenticate, validateDevice, async (req, res) => {
+  try {
+    const device = new Device({
+      ...req.body,
+      userId: req.user._id,
+      lastActive: new Date()
+    });
+    await device.save();
+    res.status(201).json(device);
+  } catch (error) {
+    res.status(400).json({ error: 'Device registration failed' });
+  }
+});
+
+app.delete('/api/devices/:id', authenticate, async (req, res) => {
+  try {
+    const device = await Device.findOne({
+      _id: req.params.id,
+      userId: req.user._id
+    });
+
+    if (!device) return res.status(404).json({ error: 'Device not found' });
+
+    await Device.deleteOne({ _id: req.params.id });
+    res.status(200).json({ message: 'Device deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete device' });
+  }
+});
+
+// Notification Routes
+app.get('/api/notifications', authenticate, async (req, res) => {
+  try {
+    const notifications = await Notification.find({ userId: req.user._id })
+      .sort({ timestamp: -1 })
+      .limit(50);
+    res.json(notifications);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch notifications' });
+  }
+});
+
+app.delete('/api/notifications/:id', authenticate, async (req, res) => {
+  try {
+    await Notification.deleteOne({
+      _id: req.params.id,
+      userId: req.user._id
+    });
+    res.status(200).json({ message: 'Notification deleted' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete notification' });
+  }
+});
+
+app.delete('/api/notifications', authenticate, async (req, res) => {
+  try {
+    await Notification.deleteMany({ userId: req.user._id });
+    res.status(200).json({ message: 'All notifications cleared' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to clear notifications' });
+  }
+});
+
+// Data Routes
 app.get('/api/data/historical', authenticate, async (req, res) => {
   try {
     const getStartDate = (range) => {
@@ -177,87 +255,23 @@ app.get('/api/data/historical', authenticate, async (req, res) => {
   }
 });
 
-app.get('/api/devices', authenticate, async (req, res) => {
-  try {
-    const query = req.user.role === 'admin' ? {} : { userId: req.user._id };
-    const devices = await Device.find(query);
-    res.json(devices);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch devices' });
-  }
-});
-
-app.get('/api/notifications', authenticate, async (req, res) => {
-  try {
-    const notifications = await Notification.find({ userId: req.user._id })
-      .sort({ timestamp: -1 })
-      .limit(50);
-    res.json(notifications);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch notifications' });
-  }
-});
-
-app.get('/api/data/export', authenticate, async (req, res) => {
-  try {
-    const getStartDate = (range) => {
-      const now = new Date();
-      const startDate = new Date(now);
-      
-      switch(range) {
-        case '1h': startDate.setHours(now.getHours() - 1); break;
-        case '24h': startDate.setDate(now.getDate() - 1); break;
-        case '7d': startDate.setDate(now.getDate() - 7); break;
-        default: startDate.setDate(now.getDate() - 1);
-      }
-      return startDate;
-    };
-
-    const data = await SensorData.find({
-      userId: req.user._id,
-      timestamp: { $gte: getStartDate(req.query.range) }
-    }).sort({ timestamp: -1 });
-
-    let csv = 'Timestamp,Temperature,Humidity\n';
-    data.forEach(d => {
-      csv += `${d.timestamp.toISOString()},${d.temperature},${d.humidity}\n`;
-    });
-
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename=sensor-data.csv');
-    res.send(csv);
-  } catch (error) {
-    res.status(500).json({ error: 'Export failed' });
-  }
-});
-
-app.post('/api/devices', authenticate, validateDevice, async (req, res) => {
-  try {
-    const device = new Device({
-      ...req.body,
-      userId: req.user._id,
-      lastActive: new Date()
-    });
-    await device.save();
-    res.status(201).json(device);
-  } catch (error) {
-    res.status(400).json({ error: 'Device registration failed' });
-  }
-});
 app.post('/api/data', authenticate, async (req, res) => {
   try {
-    const newData = new SensorData({
-      temperature: req.body.temperature,
-      humidity: req.body.humidity,
+    const { temperature, humidity } = req.body;
+    const newData = await SensorData.create({
+      temperature,
+      humidity,
       userId: req.user._id
     });
-    
-    await newData.save();
+    io.emit('newData', newData);
+
     res.status(201).json(newData);
-  } catch (error) {
-    res.status(400).json({ error: 'Failed to save sensor data' });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
+
+// WebSocket Setup
 io.on('connection', (socket) => {
   socket.on('authenticate', async (token) => {
     try {
@@ -274,41 +288,74 @@ io.on('connection', (socket) => {
       const deviceChangeStream = Device.watch([{
         $match: {
           'fullDocument.userId': user._id,
-          'operationType': { $in: ['insert', 'update'] }
+          'operationType': { $in: ['insert', 'update', 'delete'] }
+        }
+      }]);
+
+      const notificationChangeStream = Notification.watch([{
+        $match: {
+          'fullDocument.userId': user._id,
+          'operationType': { $in: ['insert', 'delete'] }
         }
       }]);
 
       sensorChangeStream.on('change', async (change) => {
-        const data = change.fullDocument;
-        if (data.temperature > user.alertPreferences.maxTemp ||
-            data.humidity > user.alertPreferences.maxHumidity) {
-          const notification = new Notification({
-            message: `Alert! Temp: ${data.temperature}°C, Humidity: ${data.humidity}%`,
-            userId: user._id
-          });
-          await notification.save();
+        try {
+          const data = change.fullDocument;
           
-          socket.emit('alert', {
-            message: notification.message,
-            timestamp: notification.timestamp
-          });
+          // Broadcast new data to all clients
+          io.emit('newData', data);
+      
+          // Check for alerts
+          if (data.temperature > user.alertPreferences.maxTemp || 
+              data.humidity > user.alertPreferences.maxHumidity) {
+            
+            const notification = await Notification.create({
+              message: `ALERT! Temp: ${data.temperature}°C, Humidity: ${data.humidity}%`,
+              userId: user._id,
+              type: 'alert'
+            });
+      
+            // Broadcast notification to all clients
+            io.emit('newNotification', notification);
+          }
+        } catch (err) {
+          console.error('Change stream error:', err);
         }
-        socket.emit('newData', data);
+      });
+      
+      // Add notification change stream
+      const notificationStream = Notification.watch(
+        [{
+          $match: {
+            'fullDocument.userId': user._id,
+            'operationType': 'insert'
+          }
+        }],
+        { fullDocument: 'updateLookup' }
+      );
+      
+      notificationStream.on('change', (change) => {
+        io.emit('newNotification', change.fullDocument);
+      });
+      deviceChangeStream.on('change', (change) => {
+        if (change.operationType === 'delete') {
+          socket.emit('deviceDeleted', change.documentKey._id);
+        } else {
+          socket.emit('deviceUpdate', change.fullDocument);
+        }
       });
 
-      deviceChangeStream.on('change', async (change) => {
-        if (change.operationType === 'update') {
-          await Device.findByIdAndUpdate(
-            change.documentKey._id,
-            { lastActive: new Date() }
-          );
+      notificationChangeStream.on('change', (change) => {
+        if (change.operationType === 'delete') {
+          socket.emit('notificationDeleted', change.documentKey._id);
         }
-        socket.emit('deviceUpdate', change.fullDocument);
       });
 
       socket.on('disconnect', () => {
         sensorChangeStream.close();
         deviceChangeStream.close();
+        notificationChangeStream.close();
       });
 
     } catch (err) {
@@ -317,6 +364,7 @@ io.on('connection', (socket) => {
   });
 });
 
+// Database Connection
 const connectDB = async () => {
   try {
     await mongoose.connect('mongodb://localhost:27017/iot_data', {
