@@ -1,388 +1,281 @@
-const express = require('express');
-const mongoose = require('mongoose');
-const cors = require('cors');
-const { Server } = require('socket.io');
-const http = require('http');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
-const rateLimit = require('express-rate-limit');
+'use strict';
+
+
+require('dotenv').config();
+const express            = require('express');
+const mongoose           = require('mongoose');
+const cors               = require('cors');
+const helmet             = require('helmet');
+const mongoSanitize      = require('express-mongo-sanitize');
+const xssClean           = require('xss-clean');
+const morgan             = require('morgan');
+require('express-async-errors');
+const { Server }         = require('socket.io');
+const http               = require('http');
+const bcrypt             = require('bcrypt');
+const jwt                = require('jsonwebtoken');
+const rateLimit          = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
 
-const app = express();
-const server = http.createServer(app);
-const JWT_SECRET = 'your_secure_jwt_secret';
+const {
+  PORT           = 5000,
+  MONGO_URI,
+  JWT_SECRET,
+  JWT_EXPIRES_IN = '1h',
+  CORS_ORIGIN    = 'http://localhost:3000',
+  SALT_ROUNDS    = 12
+} = process.env;
 
-const io = new Server(server, {
-  cors: {
-    origin: "http://localhost:3000",
-    methods: ["GET", "POST", "DELETE"],
-    credentials: true
-  }
+if (!MONGO_URI || !JWT_SECRET) {
+  throw new Error('MONGO_URI and JWT_SECRET must be defined in your environment');
+}
+
+const app    = express();
+const server = http.createServer(app);
+const io     = new Server(server, {
+  cors: { origin: CORS_ORIGIN, methods: ['GET', 'POST', 'DELETE'], credentials: true }
 });
 
-app.use(express.json());
-app.use(cors({
-  origin: "http://localhost:3000",
-  credentials: true
-}));
+app.set('trust proxy', 1);
+app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
+app.use(helmet());
+app.use(express.json({ limit: '10kb' }));
+app.use(mongoSanitize());
+app.use(xssClean());
+app.use(morgan('dev'));
 
+// Rate‑limit auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 5,
-  message: 'Too many login attempts, please try again later'
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts, please try again later.' }
 });
 
-// Database schemas
 const notificationSchema = new mongoose.Schema({
-  message: String,
+  message:   { type: String, required: true, trim: true },
   timestamp: { type: Date, default: Date.now },
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  read: { type: Boolean, default: false }
+  userId:    { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
+  read:      { type: Boolean, default: false }
 });
 
 const userSchema = new mongoose.Schema({
-  username: { type: String, unique: true },
-  password: String,
-  role: { type: String, enum: ['user', 'admin'], default: 'user' },
+  username: { type: String, unique: true, required: true, trim: true },
+  password: { type: String, required: true, minlength: 8, select: false },
+  role:     { type: String, enum: ['user', 'admin'], default: 'user' },
   alertPreferences: {
-    maxTemp: { type: Number, default: 30 },
+    maxTemp:     { type: Number, default: 30 },
     maxHumidity: { type: Number, default: 70 }
   }
+}, { timestamps: true });
+
+userSchema.pre('save', async function (next) {
+  if (!this.isModified('password')) return next();
+  this.password = await bcrypt.hash(this.password, Number(SALT_ROUNDS));
+  next();
 });
 
+userSchema.methods.correctPassword = async function (candidate, actual) {
+  return bcrypt.compare(candidate, actual);
+};
+
 const sensorSchema = new mongoose.Schema({
-  temperature: Number,
-  humidity: Number,
-  timestamp: { type: Date, default: Date.now },
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+  temperature: { type: Number, required: true },
+  humidity:    { type: Number, required: true },
+  timestamp:   { type: Date, default: Date.now },
+  userId:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true }
 });
 
 const deviceSchema = new mongoose.Schema({
-  name: String,
-  type: String,
-  location: String,
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  lastActive: Date
+  name:       { type: String, required: true },
+  type:       { type: String },
+  location:   { type: String },
+  userId:     { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
+  lastActive: { type: Date, default: Date.now }
 });
 
-deviceSchema.virtual('status').get(function() {
-  const inactiveTime = Date.now() - this.lastActive.getTime();
-  return inactiveTime < 300000 ? 'online' : 'offline';
+deviceSchema.virtual('status').get(function () {
+  return Date.now() - this.lastActive.getTime() < 300_000 ? 'online' : 'offline';
 });
 
-const User = mongoose.model('User', userSchema);
-const SensorData = mongoose.model('SensorData', sensorSchema, 'sensor_data');
-const Device = mongoose.model('Device', deviceSchema);
+deviceSchema.set('toJSON', { virtuals: true });
+
+const User         = mongoose.model('User', userSchema);
+const SensorData   = mongoose.model('SensorData', sensorSchema);
+const Device       = mongoose.model('Device', deviceSchema);
 const Notification = mongoose.model('Notification', notificationSchema);
 
-const authenticate = async (req, res, next) => {
+
+const signToken = (id) => jwt.sign({ id }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+
+const authenticate = async (req, _res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) return next({ statusCode: 401, message: 'Missing token' });
+
   try {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) throw new Error('No token provided');
-    
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = await User.findById(decoded.userId);
-    if (!req.user) throw new Error('User not found');
-    
+    const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
+    const user    = await User.findById(decoded.id);
+    if (!user) throw new Error();
+    req.user = user;
     next();
-  } catch (err) {
-    res.status(401).json({ error: 'Authentication failed' });
+  } catch {
+    next({ statusCode: 401, message: 'Invalid or expired token' });
   }
 };
 
 const validateDevice = [
   body('name').trim().escape().notEmpty(),
   body('location').trim().escape().notEmpty(),
-  (req, res, next) => {
+  (req, _res, next) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+    if (!errors.isEmpty()) return next({ statusCode: 400, errors: errors.array() });
     next();
   }
 ];
 
-// Auth Routes
-app.post('/api/auth/register', authLimiter, async (req, res) => {
-  try {
-    const hashedPassword = await bcrypt.hash(req.body.password, 10);
-    const user = new User({
-      username: req.body.username,
-      password: hashedPassword
-    });
-    await user.save();
-    res.status(201).json({ message: 'User created' });
-  } catch (error) {
-    res.status(400).json({ error: 'Registration failed: ' + error.message });
+
+app.post('/api/auth/register',
+  authLimiter,
+  body('username').isAlphanumeric().notEmpty(),
+  body('password').isLength({ min: 8 }),
+  async (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return next({ statusCode: 400, errors: errors.array() });
+
+    const { username, password } = req.body;
+    const user = await User.create({ username, password });
+    res.status(201).json({ token: signToken(user._id) });
   }
+);
+
+app.post('/api/auth/login', authLimiter, async (req, res, next) => {
+  const { username, password } = req.body;
+  const user = await User.findOne({ username }).select('+password');
+  if (!user || !(await user.correctPassword(password, user.password))) {
+    return next({ statusCode: 400, message: 'Invalid credentials' });
+  }
+  user.password = undefined;
+  res.json({ token: signToken(user._id), user });
 });
 
-app.post('/api/auth/login', authLimiter, async (req, res) => {
-  try {
-    const user = await User.findOne({ username: req.body.username });
-    if (!user) return res.status(400).json({ error: 'Invalid credentials' });
 
-    const validPassword = await bcrypt.compare(req.body.password, user.password);
-    if (!validPassword) return res.status(400).json({ error: 'Invalid credentials' });
-
-    const token = jwt.sign({ userId: user._id }, JWT_SECRET);
-    res.json({
-      token,
-      user: {
-        id: user._id,
-        username: user.username,
-        role: user.role
-      },
-      alertPreferences: user.alertPreferences
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Login failed: ' + error.message });
-  }
+app.put('/api/alerts', authenticate, async (req, res, next) => {
+  const updated = await User.findByIdAndUpdate(
+    req.user._id,
+    { alertPreferences: req.body },
+    { new: true, runValidators: true }
+  );
+  res.json(updated.alertPreferences);
 });
 
-// Alert Settings
-app.put('/api/alerts', authenticate, async (req, res) => {
-  try {
-    const updatedUser = await User.findByIdAndUpdate(
-      req.user._id,
-      { $set: { alertPreferences: req.body } },
-      { new: true }
-    );
-    res.json(updatedUser.alertPreferences);
-  } catch (error) {
-    res.status(400).json({ error: 'Update failed: ' + error.message });
-  }
-});
 
-// Device Routes
 app.get('/api/devices', authenticate, async (req, res) => {
-  try {
-    const query = req.user.role === 'admin' ? {} : { userId: req.user._id };
-    const devices = await Device.find(query);
-    res.json(devices);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch devices' });
-  }
+  const filter  = req.user.role === 'admin' ? {} : { userId: req.user._id };
+  const devices = await Device.find(filter).lean({ virtuals: true });
+  res.json(devices);
 });
 
 app.post('/api/devices', authenticate, validateDevice, async (req, res) => {
-  try {
-    const device = new Device({
-      ...req.body,
-      userId: req.user._id,
-      lastActive: new Date()
-    });
-    await device.save();
-    res.status(201).json(device);
-  } catch (error) {
-    res.status(400).json({ error: 'Device registration failed' });
-  }
+  const device = await Device.create({ ...req.body, userId: req.user._id });
+  res.status(201).json(device);
 });
 
-app.delete('/api/devices/:id', authenticate, async (req, res) => {
-  try {
-    const device = await Device.findOne({
-      _id: req.params.id,
-      userId: req.user._id
-    });
-
-    if (!device) return res.status(404).json({ error: 'Device not found' });
-
-    await Device.deleteOne({ _id: req.params.id });
-    res.status(200).json({ message: 'Device deleted successfully' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to delete device' });
-  }
+app.delete('/api/devices/:id', authenticate, async (req, res, next) => {
+  const result = await Device.deleteOne({ _id: req.params.id, userId: req.user._id });
+  if (!result.deletedCount) return next({ statusCode: 404, message: 'Device not found' });
+  res.status(204).end();
 });
 
-// Notification Routes
+
 app.get('/api/notifications', authenticate, async (req, res) => {
-  try {
-    const notifications = await Notification.find({ userId: req.user._id })
-      .sort({ timestamp: -1 })
-      .limit(50);
-    res.json(notifications);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch notifications' });
-  }
+  const notifications = await Notification.find({ userId: req.user._id })
+    .sort('-timestamp')
+    .limit(50)
+    .lean();
+  res.json(notifications);
 });
 
 app.delete('/api/notifications/:id', authenticate, async (req, res) => {
-  try {
-    await Notification.deleteOne({
-      _id: req.params.id,
-      userId: req.user._id
-    });
-    res.status(200).json({ message: 'Notification deleted' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to delete notification' });
-  }
+  await Notification.deleteOne({ _id: req.params.id, userId: req.user._id });
+  res.status(204).end();
 });
 
 app.delete('/api/notifications', authenticate, async (req, res) => {
-  try {
-    await Notification.deleteMany({ userId: req.user._id });
-    res.status(200).json({ message: 'All notifications cleared' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to clear notifications' });
-  }
+  await Notification.deleteMany({ userId: req.user._id });
+  res.status(204).end();
 });
 
-// Data Routes
+
 app.get('/api/data/historical', authenticate, async (req, res) => {
-  try {
-    const getStartDate = (range) => {
-      const now = new Date();
-      const startDate = new Date(now);
-      
-      switch(range) {
-        case '1h': startDate.setHours(now.getHours() - 1); break;
-        case '24h': startDate.setDate(now.getDate() - 1); break;
-        case '7d': startDate.setDate(now.getDate() - 7); break;
-        default: startDate.setDate(now.getDate() - 1);
-      }
-      return startDate;
-    };
+  const { range = '24h' } = req.query;
+  const ranges = { '1h': 1, '24h': 24, '7d': 168 };
+  const hours  = ranges[range] ?? 24;
+  const from   = new Date(Date.now() - hours * 3600_000);
 
-    const data = await SensorData.find({
-      userId: req.user._id,
-      timestamp: { $gte: getStartDate(req.query.range) }
-    }).sort({ timestamp: -1 });
-
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch historical data' });
-  }
+  const data = await SensorData.find({ userId: req.user._id, timestamp: { $gte: from } })
+    .sort('-timestamp')
+    .lean();
+  res.json(data);
 });
 
 app.post('/api/data', authenticate, async (req, res) => {
-  try {
-    const { temperature, humidity } = req.body;
-    const newData = await SensorData.create({
-      temperature,
-      humidity,
-      userId: req.user._id
-    });
-    io.emit('newData', newData);
-
-    res.status(201).json(newData);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  const { temperature, humidity } = req.body;
+  const newData = await SensorData.create({ temperature, humidity, userId: req.user._id });
+  io.to(req.user._id.toString()).emit('newData', newData);
+  res.status(201).json(newData);
 });
 
-// WebSocket Setup
+
 io.on('connection', (socket) => {
   socket.on('authenticate', async (token) => {
     try {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      const user = await User.findById(decoded.userId);
+      const { id } = jwt.verify(token, JWT_SECRET);
+      const user   = await User.findById(id);
+      if (!user) throw new Error();
 
-      const sensorChangeStream = SensorData.watch([{ 
-        $match: { 
-          'fullDocument.userId': user._id,
-          'operationType': 'insert'
-        } 
-      }]);
+      const room = user._id.toString();
+      socket.join(room);
 
-      const deviceChangeStream = Device.watch([{
-        $match: {
-          'fullDocument.userId': user._id,
-          'operationType': { $in: ['insert', 'update', 'delete'] }
-        }
-      }]);
+      const sensorStream = SensorData.watch([
+        { $match: { 'fullDocument.userId': user._id, operationType: 'insert' } }
+      ]);
+      sensorStream.on('change', ({ fullDocument }) => io.to(room).emit('newData', fullDocument));
 
-      const notificationChangeStream = Notification.watch([{
-        $match: {
-          'fullDocument.userId': user._id,
-          'operationType': { $in: ['insert', 'delete'] }
-        }
-      }]);
-
-      sensorChangeStream.on('change', async (change) => {
-        try {
-          const data = change.fullDocument;
-          
-          // Broadcast new data to all clients
-          io.emit('newData', data);
-      
-          // Check for alerts
-          if (data.temperature > user.alertPreferences.maxTemp || 
-              data.humidity > user.alertPreferences.maxHumidity) {
-            
-            const notification = await Notification.create({
-              message: `ALERT! Temp: ${data.temperature}°C, Humidity: ${data.humidity}%`,
-              userId: user._id,
-              type: 'alert'
-            });
-      
-            // Broadcast notification to all clients
-            io.emit('newNotification', notification);
-          }
-        } catch (err) {
-          console.error('Change stream error:', err);
-        }
-      });
-      
-      // Add notification change stream
-      const notificationStream = Notification.watch(
-        [{
-          $match: {
-            'fullDocument.userId': user._id,
-            'operationType': 'insert'
-          }
-        }],
-        { fullDocument: 'updateLookup' }
-      );
-      
-      notificationStream.on('change', (change) => {
-        io.emit('newNotification', change.fullDocument);
-      });
-      deviceChangeStream.on('change', (change) => {
-        if (change.operationType === 'delete') {
-          socket.emit('deviceDeleted', change.documentKey._id);
-        } else {
-          socket.emit('deviceUpdate', change.fullDocument);
-        }
-      });
-
-      notificationChangeStream.on('change', (change) => {
-        if (change.operationType === 'delete') {
-          socket.emit('notificationDeleted', change.documentKey._id);
-        }
-      });
+      const notificationStream = Notification.watch([
+        { $match: { 'fullDocument.userId': user._id, operationType: 'insert' } }
+      ]);
+      notificationStream.on('change', ({ fullDocument }) => io.to(room).emit('newNotification', fullDocument));
 
       socket.on('disconnect', () => {
-        sensorChangeStream.close();
-        deviceChangeStream.close();
-        notificationChangeStream.close();
+        sensorStream.close();
+        notificationStream.close();
       });
-
-    } catch (err) {
+    } catch {
       socket.disconnect();
     }
   });
 });
 
-// Database Connection
-const connectDB = async () => {
-  try {
-    await mongoose.connect('mongodb://localhost:27017/iot_data', {
-      useNewUrlParser: true,
-      useUnifiedTopology: true
-    });
-    console.log('MongoDB Connected');
-    
-    await Device.createIndexes({ userId: 1 });
-    await Notification.createIndexes({ userId: 1, timestamp: -1 });
-    
-    server.listen(5000, () => {
-      console.log('Server running on http://localhost:5000');
-    });
-  } catch (err) {
-    console.error('Database connection failed:', err);
-    process.exit(1);
-  }
-};
 
-connectDB();
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  if (err.errors) return res.status(err.statusCode || 400).json({ errors: err.errors });
+  res.status(err.statusCode || 500).json({ error: err.message || 'Server Error' });
+});
+
+
+mongoose.set('strictQuery', true);
+mongoose.connect(MONGO_URI).then(() => {
+  console.log('MongoDB connected');
+  server.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+}).catch((err) => {
+  console.error('Database connection failed', err);
+  process.exit(1);
+});
+
+// Graceful shutdown
+['SIGINT', 'SIGTERM'].forEach((sig) => process.on(sig, () => {
+  server.close(() => process.exit(0));
+}));
+
